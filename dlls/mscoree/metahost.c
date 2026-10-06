@@ -163,8 +163,9 @@ static void CDECL set_log_handler_dummy (MonoLogCallback callback, void *user_da
 
 /* iOS-Madeira ml1282: Mono settings this port needs, set before Mono starts.
  *
- * Only a process that loads Wine Mono gets here, and only a 32-bit one: 64-bit .NET
- * programs ran without these and were not tested with them. Mono reads both through
+ * Only a process that loads Wine Mono gets here, 32-bit or 64-bit: a 64-bit FNA game's GC
+ * spun in the same hybrid-suspend loop (10,000 SuspendThread/ResumeThread pairs on one
+ * worker, no first frame) and ran to its stage with these set. Mono reads both through
  * g_getenv = GetEnvironmentVariableW, once, in mono_jit_init_version (mono_thread_info_init
  * and mini_parse_debug_options); madeira_mono_env_restore then puts the previous values
  * back, so a child process does not inherit them (a .NET launcher's Unity game would hand
@@ -177,7 +178,6 @@ static void CDECL set_log_handler_dummy (MonoLogCallback callback, void *user_da
  *    EnumDisplayMonitors still called it back (NullReferenceException in
  *    Screen+MonitorEnumCallback, Terraria); keep-delegates keeps such trampolines alive.
  * A value already present wins; MADEIRA_MONO_DEFAULTS=0 sets nothing. */
-#ifdef __i386__
 static struct { const char *name; BOOL changed, had; char value[512]; } madeira_mono_saved[2] =
     { { "MONO_THREADS_SUSPEND" }, { "MONO_DEBUG" } };
 
@@ -237,7 +237,6 @@ static void madeira_mono_env_restore(void)
         madeira_mono_saved[i].changed = FALSE;
     }
 }
-#endif
 
 static HRESULT load_mono(LPCWSTR mono_path)
 {
@@ -271,9 +270,7 @@ static HRESULT load_mono(LPCWSTR mono_path)
 
         if (!find_mono_dll(mono_path, mono_dll_path)) goto fail;
 
-#ifdef __i386__
         madeira_mono_env_defaults();
-#endif
         mono_handle = LoadLibraryW(mono_dll_path);
 
         if (!mono_handle) goto fail;
@@ -461,9 +458,7 @@ MonoDomain* get_root_domain(void)
         exe_basename = get_exe_basename_utf8();
 
         root_domain = mono_jit_init_version(exe_basename, "v4.0.30319");
-#ifdef __i386__
         madeira_mono_env_restore();
-#endif
 
         free(exe_basename);
 
