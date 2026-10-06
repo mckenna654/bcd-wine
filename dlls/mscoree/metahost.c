@@ -20,6 +20,7 @@
 
 #include <stdio.h>
 #include <stdarg.h>
+#include <string.h>
 #include <assert.h>
 
 #define COBJMACROS
@@ -160,6 +161,47 @@ static void CDECL set_log_handler_dummy (MonoLogCallback callback, void *user_da
 {
 }
 
+/* iOS-Madeira ml1282: Mono settings this port needs, set before Mono starts.
+ *
+ * Only a process that loads Wine Mono gets here, so these never reach a Unity game (its
+ * own mono-2.0-bdwgc.dll does not go through mscoree). Mono reads both through
+ * g_getenv = GetEnvironmentVariableW, and only for this process.
+ *  - MONO_THREADS_SUSPEND=coop: the default hybrid suspend stops threads with
+ *    SuspendThread + GetThreadContext, and on iOS a suspended thread keeps running
+ *    (MADEIRA_REAL_SUSPEND is off), so the GC moved objects under a live thread and Mono
+ *    aborted with "Cannot transition thread ... with DONE_BLOCKING" (Terraria).
+ *  - MONO_DEBUG += keep-delegates: a delegate handed to native code was finalized while
+ *    EnumDisplayMonitors still called it back (NullReferenceException in
+ *    Screen+MonitorEnumCallback, Terraria); keep-delegates keeps such trampolines alive.
+ * A value already present wins; MADEIRA_MONO_DEFAULTS=0 sets nothing. */
+static void madeira_mono_env_defaults(void)
+{
+    char buf[512];
+    DWORD len;
+
+    if (GetEnvironmentVariableA("MADEIRA_MONO_DEFAULTS", buf, sizeof(buf)) && buf[0] == '0')
+    {
+        ERR("iOS-Madeira ml1282: MADEIRA_MONO_DEFAULTS=0, Mono settings left alone\n");
+        return;
+    }
+    if (!GetEnvironmentVariableA("MONO_THREADS_SUSPEND", buf, sizeof(buf)))
+        SetEnvironmentVariableA("MONO_THREADS_SUSPEND", "coop");
+    len = GetEnvironmentVariableA("MONO_DEBUG", buf, sizeof(buf));
+    if (!len)
+        SetEnvironmentVariableA("MONO_DEBUG", "keep-delegates");
+    else if (len < sizeof(buf) - sizeof(",keep-delegates") && !strstr(buf, "keep-delegates"))
+    {
+        strcat(buf, ",keep-delegates");
+        SetEnvironmentVariableA("MONO_DEBUG", buf);
+    }
+    {
+        char suspend[64];
+        if (!GetEnvironmentVariableA("MONO_THREADS_SUSPEND", suspend, sizeof(suspend))) suspend[0] = 0;
+        if (!GetEnvironmentVariableA("MONO_DEBUG", buf, sizeof(buf))) buf[0] = 0;
+        ERR("iOS-Madeira ml1282: MONO_THREADS_SUSPEND=%s MONO_DEBUG=%s\n", suspend, buf);
+    }
+}
+
 static HRESULT load_mono(LPCWSTR mono_path)
 {
     static const WCHAR lib[] = {'\\','l','i','b',0};
@@ -192,6 +234,7 @@ static HRESULT load_mono(LPCWSTR mono_path)
 
         if (!find_mono_dll(mono_path, mono_dll_path)) goto fail;
 
+        madeira_mono_env_defaults();
         mono_handle = LoadLibraryW(mono_dll_path);
 
         if (!mono_handle) goto fail;
