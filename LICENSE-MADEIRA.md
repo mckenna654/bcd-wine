@@ -55,6 +55,9 @@ distributes under **LGPL-2.1-or-later**. This branch keeps that licence.
     above and came first; it is recorded as merged with no change of its own.
   - Author bahacan16, merged on 2026-10-06: `67b8c8bed51` (xinput1_3 iOS:
     send XInputSetState motors to the host pad, pull request #20).
+  - Author spitefulowl, merged on 2026-10-06: `000cac48452` (mscoree iOS:
+    cooperative thread suspend and keep-delegates for Wine Mono, pull request
+    #26).
 
 The LGPL permits combining this library with proprietary components (such
 as Apple's Metal Shader Converter) subject to LGPL-2.1 section 6; see the
