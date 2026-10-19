@@ -489,7 +489,7 @@ HRESULT ios_joystick_enum_device( DWORD type, DWORD flags, DIDEVICEINSTANCEW *in
     instance->wUsagePage = HID_USAGE_PAGE_GENERIC;
     instance->wUsage = HID_USAGE_GENERIC_GAMEPAD;
     lstrcpynW( instance->tszInstanceName, L"Gamepad", MAX_PATH );
-    lstrcpynW( instance->tszProductName, L"Madeira Gamepad", MAX_PATH );
+    lstrcpynW( instance->tszProductName, L"BCD Gamepad", MAX_PATH );
 
     /* Honour the same HKCU\Software\Wine\DirectInput\Joysticks disable list
      * the HID path honours, so a title that has to be told to ignore a pad can
