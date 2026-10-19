@@ -4649,7 +4649,7 @@ static void madeira_file_trace( const char *what, unsigned int status, const UNI
     nb[k] = 0;
     /* Madeira's own shader cache (madeira_d3d12's .msc files) is not the game's I/O and
      * used most of the budget in the first GTA trace (log 2026-10-02 13:21:28). */
-    if (strstr( nb, "\\Madeira\\ShaderCache" )) return;
+    if (strstr( nb, "\\BCD\\ShaderCache" )) return;
     if (status == 0xc0000034 && k > 4)
     {
         const char *x = nb + k - 4;
