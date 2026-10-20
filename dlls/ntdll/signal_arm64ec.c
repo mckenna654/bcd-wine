@@ -3595,8 +3595,56 @@ static void dispatch_syscall( ARM64_NT_CONTEXT *context )
 }
 
 
+extern char arm64x_check_call_probe_begin[], arm64x_check_call_probe_end[];
+
+/* The check-call code reads a non-EC destination to recognise optional x64
+ * fast-forward, syscall and indirect-jump sequences. An inaccessible target
+ * must fault in the emulator, rather than expose this native probe's PC to
+ * an x64 exception hook (which can resume it at an x86 instruction boundary).
+ * Finish the same exit-thunk selection as .Lexit, without changing the page
+ * protection or delivering/suppressing the eventual guest exception.
+ *
+ * Only the iOS native probe path is eligible. In particular, a fault in
+ * translated code, a bitmap lookup or an unrelated native function is not a
+ * failed optional probe. Labels keep the range independent of image layout. */
+static BOOL recover_arm64x_code_probe( EXCEPTION_RECORD *rec, ARM64_NT_CONTEXT *ctx )
+{
+    ULONG_PTR pc, begin, end;
+
+    if (!p_ios_jit_reverse_translate_addr || !pBeginSimulation ||
+        !get_arm64ec_cpu_area() || get_arm64ec_cpu_area()->InSimulation ||
+        rec->ExceptionCode != STATUS_ACCESS_VIOLATION ||
+        rec->NumberParameters != 2 || rec->ExceptionInformation[0] != 0 ||
+        !ctx->Lr || (ctx->Lr & 3) || !ctx->X10 || (ctx->X10 & 3))
+        return FALSE;
+
+    pc = (ULONG_PTR)xlate_ios_jit_rev( (void *)(ULONG_PTR)ctx->Pc );
+    begin = (ULONG_PTR)xlate_ios_jit_rev( arm64x_check_call_probe_begin );
+    end = (ULONG_PTR)xlate_ios_jit_rev( arm64x_check_call_probe_end );
+    if (!begin || end <= begin || pc < begin || pc >= end || (pc & 3)) return FALSE;
+
+    ctx->X9 = ctx->X11;
+    ctx->X11 = ctx->X10;
+    ctx->Pc = ctx->Lr;
+    return TRUE;
+}
+
 static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD *rec, ARM64EC_NT_CONTEXT *context, ARM64_NT_CONTEXT *arm_ctx )
 {
+    if (rec->ExceptionCode == STATUS_ACCESS_VIOLATION)
+    {
+        ARM64_NT_CONTEXT probe_ctx = *arm_ctx;
+        if (recover_arm64x_code_probe( rec, &probe_ctx ))
+        {
+            static LONG probe_n;
+            if (InterlockedIncrement( &probe_n ) <= 16)
+                ERR( "[ec-probe-fallback] native probe %p target %p unreadable; returning to x64 exit thunk\n",
+                     (void *)(ULONG_PTR)arm_ctx->Pc, (void *)(ULONG_PTR)arm_ctx->X11 );
+            /* Use the native syscall: NtContinue's public EC wrapper converts an
+             * x64 context. Leave the original context intact if continuation fails. */
+            syscall_NtContinue( &probe_ctx, FALSE );
+        }
+    }
     if (rec->ExceptionCode == STATUS_EMULATION_SYSCALL) dispatch_syscall( arm_ctx );
     context_arm_to_x64( context, arm_ctx );
     /* iOS-Madeira task#34 probe: FEX's LogMan output is invisible on iOS (its
@@ -4910,6 +4958,8 @@ static void __attribute__((naked)) arm64x_check_call(void)
          /* check if dest is aligned */
          "tst x11, #15\n\t"                 /* dest & 15 */
          "b.ne .Ljmp\n\t"
+         ".globl arm64x_check_call_probe_begin\n"
+         "arm64x_check_call_probe_begin:\n\t"
          "ldr x16, [x11]\n\t"               /* dest code */
          /* check for fast-forward sequence */
          "ldr x17, .Lffwd_seq\n\t"
@@ -4956,6 +5006,8 @@ static void __attribute__((naked)) arm64x_check_call(void)
          "ldr x11, [x16, w9, sxtw]\n\t"
          "b \"#arm64x_check_call\"\n"       /* restart checks with jump destination */
          /* not a special sequence, call the exit thunk */
+         ".globl arm64x_check_call_probe_end\n"
+         "arm64x_check_call_probe_end:\n\t"
          ".Lexit:\n\t"
          "mov x9, x11\n\t"
          "mov x11, x10\n\t"
