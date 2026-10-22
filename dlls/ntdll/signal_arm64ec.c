@@ -55,6 +55,8 @@ static unsigned int (WINAPI *pBTCpu64IosReleaseThreadHolds)(void*, unsigned long
 static void     (WINAPI *pBTCpu64NotifyMemoryDirty)(void*,SIZE_T);
 static void     (WINAPI *pBTCpu64NotifyReadFile)(HANDLE,void*,SIZE_T,BOOL,NTSTATUS);
 static void     (WINAPI *pBeginSimulation)(void);
+/* Native dispatcher exports, retained before hybrid pointer redirection. */
+static void *ios_exit_to_x64, *ios_dispatch_jump;
 static void     (WINAPI *pFlushInstructionCacheHeavy)(const void*,SIZE_T);
 static NTSTATUS (WINAPI *pNotifyMapViewOfSection)(void*,void*,void*,SIZE_T,ULONG,ULONG);
 static void     (WINAPI *pNotifyImageMap)(void*);
@@ -602,6 +604,8 @@ NTSTATUS arm64ec_process_init_dispatchers( HMODULE module )
     __os_arm64x_dispatch_call_no_redirect = RtlFindExportedRoutineByName( module, "ExitToX64" );
     __os_arm64x_dispatch_fptr = RtlFindExportedRoutineByName( module, "DispatchJump" );
     __os_arm64x_dispatch_ret = RtlFindExportedRoutineByName( module, "RetToEntryThunk" );
+    ios_exit_to_x64 = __os_arm64x_dispatch_call_no_redirect;
+    ios_dispatch_jump = __os_arm64x_dispatch_fptr;
 
     /* The dispatcher globals were 0 when EVERY ARM64EC module's
      * arm64ec_update_hybrid_metadata ran (because the globals only get set
@@ -3629,6 +3633,85 @@ static BOOL recover_arm64x_code_probe( EXCEPTION_RECORD *rec, ARM64_NT_CONTEXT *
     return TRUE;
 }
 
+static BOOL emulator_probe_recovery_enabled(void)
+{
+    UNICODE_STRING name, value;
+    WCHAR buffer[2];
+
+    RtlInitUnicodeString( &name, L"MADEIRA_D2R_PROBE_RECOVERY" );
+    value.Buffer = buffer;
+    value.Length = 0;
+    value.MaximumLength = sizeof(buffer);
+    return !RtlQueryEnvironmentVariable_U( NULL, &name, &value ) &&
+           value.Length == sizeof(WCHAR) && buffer[0] == '1';
+}
+
+/* The iOS emulator's ExitToX64 also inspects a destination before entering
+ * emulation, to recognise an optional fast-forward sequence. A failed read
+ * there must take the ordinary exported DispatchJump path. Both dispatchers
+ * receive the target in X9 and push LR exactly once; none of the argument,
+ * stack or nonvolatile registers have changed at these three reads.
+ *
+ * This is an integration guard for the known dispatcher ABI, not a generic
+ * native-fault recovery. Validate the entire probe prefix at its export,
+ * recognise only its target reads, and decline unknown emulator versions.
+ * In particular, bitmap and alias-table faults must remain exceptions. */
+static BOOL recover_emulator_code_probe( EXCEPTION_RECORD *rec, ARM64_NT_CONTEXT *ctx )
+{
+    static const ULONG prefix[] =
+    {
+        0xf9400130, /* ldr x16,[x9] */
+        0xd2916911, 0xf2a91891, 0xf2cb1131, 0xf2eaa411, /* FFS pattern in x17 */
+        0xeb11021f, /* cmp x16,x17 */
+        0x54000001, /* b.ne ordinary entry (displacement checked separately) */
+        0x79401130, /* ldrh w16,[x9,#8] */
+        0x529d2bb1, /* mov w17,#0xe95d */
+        0x6b11021f, /* cmp w16,w17 */
+        0x54000001, /* b.ne same ordinary entry */
+        0xb880a130  /* ldursw x16,[x9,#10] */
+    };
+    const ULONG *code;
+    ULONG_PTR pc, entry, jump, offset, length;
+    unsigned int i;
+
+    if (!p_ios_jit_reverse_translate_addr || !pBeginSimulation ||
+        !emulator_probe_recovery_enabled() ||
+        !ios_exit_to_x64 || !ios_dispatch_jump ||
+        !get_arm64ec_cpu_area() || get_arm64ec_cpu_area()->InSimulation ||
+        rec->ExceptionCode != STATUS_ACCESS_VIOLATION || rec->NumberParameters != 2 ||
+        rec->ExceptionInformation[0] != 0 || !ctx->Lr || (ctx->Lr & 3) ||
+        ctx->X9 >> 39 || RtlIsEcCode( ctx->X9 ))
+        return FALSE;
+
+    pc = (ULONG_PTR)xlate_ios_jit_rev( (void *)(ULONG_PTR)ctx->Pc );
+    entry = (ULONG_PTR)xlate_ios_jit_rev( ios_exit_to_x64 );
+    jump = (ULONG_PTR)xlate_ios_jit( ios_dispatch_jump );
+    if (!entry || (entry & 3) || !jump || (jump & 3)) return FALSE;
+
+    if (pc == entry) { offset = 0; length = 8; }
+    else if (pc == entry + 7 * sizeof(ULONG)) { offset = 8; length = 2; }
+    else if (pc == entry + 11 * sizeof(ULONG)) { offset = 10; length = 4; }
+    else return FALSE;
+    if (rec->ExceptionInformation[1] - ctx->X9 - offset >= length) return FALSE;
+
+    code = (const ULONG *)entry;
+    for (i = 0; i < ARRAY_SIZE(prefix); i++)
+    {
+        ULONG mask = (i == 6 || i == 10) ? 0xff00001f : ~0u;
+        if ((code[i] & mask) != prefix[i]) return FALSE;
+    }
+    /* Both forward mismatch branches must select the same fallback, after
+     * the inspected prefix and before the branch-immediate sign bit. */
+    if ((code[6] & 0x00800000) || (code[10] & 0x00800000) ||
+        6 + ((code[6] >> 5) & 0x7ffff) != 10 + ((code[10] >> 5) & 0x7ffff) ||
+        6 + ((code[6] >> 5) & 0x7ffff) < ARRAY_SIZE(prefix)) return FALSE;
+
+    /* Preserve the target, LR, SP, arguments and flags. DispatchJump performs
+     * the existing stack push and emulator entry; the page stays protected. */
+    ctx->Pc = jump;
+    return TRUE;
+}
+
 static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD *rec, ARM64EC_NT_CONTEXT *context, ARM64_NT_CONTEXT *arm_ctx )
 {
     if (rec->ExceptionCode == STATUS_ACCESS_VIOLATION)
@@ -3642,6 +3725,15 @@ static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD 
                      (void *)(ULONG_PTR)arm_ctx->Pc, (void *)(ULONG_PTR)arm_ctx->X11 );
             /* Use the native syscall: NtContinue's public EC wrapper converts an
              * x64 context. Leave the original context intact if continuation fails. */
+            syscall_NtContinue( &probe_ctx, FALSE );
+        }
+        probe_ctx = *arm_ctx;
+        if (recover_emulator_code_probe( rec, &probe_ctx ))
+        {
+            static LONG emulator_probe_n;
+            if (InterlockedIncrement( &emulator_probe_n ) <= 16)
+                ERR( "[ec-emulator-probe-fallback] native probe %p target %p unreadable; entering dispatcher\n",
+                     (void *)(ULONG_PTR)arm_ctx->Pc, (void *)(ULONG_PTR)arm_ctx->X9 );
             syscall_NtContinue( &probe_ctx, FALSE );
         }
     }
